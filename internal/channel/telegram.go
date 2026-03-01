@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cexll/agentsdk-go/pkg/api"
@@ -35,6 +36,12 @@ type TelegramChannel struct {
 	feedback   string // "debug", "normal", "minimal", "silent"
 	streaming  bool
 	workspace  string // workspace root for file saving
+
+	// Media group buffering: Telegram sends multi-photo messages as separate
+	// Message objects with the same MediaGroupID. We collect them briefly
+	// before merging into a single dispatch.
+	mgMu     sync.Mutex
+	mgBuffer map[string]*mediaGroup
 }
 
 func NewTelegramChannel(cfg config.TelegramConfig, b *bus.MessageBus) (*TelegramChannel, error) {
@@ -115,6 +122,12 @@ func (t *TelegramChannel) Start(ctx context.Context) error {
 	return nil
 }
 
+// mediaGroup collects messages belonging to the same Telegram media group.
+type mediaGroup struct {
+	msgs  []*telego.Message
+	timer *time.Timer
+}
+
 func (t *TelegramChannel) handleMessage(msg *telego.Message) {
 	if msg.From == nil {
 		return
@@ -125,24 +138,109 @@ func (t *TelegramChannel) handleMessage(msg *telego.Message) {
 		return
 	}
 
+	// Media group: buffer and merge into single dispatch.
+	if msg.MediaGroupID != "" {
+		t.bufferMediaGroup(msg)
+		return
+	}
+
+	// Normal (non-group) message: dispatch immediately.
+	t.dispatchMessage(msg)
+}
+// bufferMediaGroup collects messages with the same MediaGroupID.
+// A short timer merges them into a single dispatch.
+func (t *TelegramChannel) bufferMediaGroup(msg *telego.Message) {
+	t.mgMu.Lock()
+	defer t.mgMu.Unlock()
+	if t.mgBuffer == nil {
+		t.mgBuffer = make(map[string]*mediaGroup)
+	}
+	gid := msg.MediaGroupID
+	g, ok := t.mgBuffer[gid]
+	if !ok {
+		g = &mediaGroup{}
+		t.mgBuffer[gid] = g
+		g.timer = time.AfterFunc(500*time.Millisecond, func() { t.flushMediaGroup(gid) })
+	} else {
+		g.timer.Reset(500 * time.Millisecond)
+	}
+	g.msgs = append(g.msgs, msg)
+}
+// flushMediaGroup merges all buffered messages for a media group into one dispatch.
+func (t *TelegramChannel) flushMediaGroup(gid string) {
+	t.mgMu.Lock()
+	g, ok := t.mgBuffer[gid]
+	if !ok {
+		t.mgMu.Unlock()
+		return
+	}
+	delete(t.mgBuffer, gid)
+	t.mgMu.Unlock()
+
+	if len(g.msgs) == 0 {
+		return
+	}
+	// Use the first message as the base (carries reply context, forward origin, caption).
+	primary := g.msgs[0]
+	var allContent []string
+	var allBlocks []model.ContentBlock
+
+	for _, m := range g.msgs {
+		c, b := t.extractContent(m)
+		if c != "" {
+			allContent = append(allContent, c)
+		}
+		allBlocks = append(allBlocks, b...)
+	}
+
+	// Deduplicate text: reply context and forward labels appear in every message
+	// of the group, but we only want them once. Use the first message's full
+	// content and only append unique captions from subsequent messages.
+	content := allContent[0]
+	if len(allContent) > 1 {
+		seen := map[string]bool{content: true}
+		for _, c := range allContent[1:] {
+			if !seen[c] {
+				seen[c] = true
+				content += "\n" + c
+			}
+		}
+	}
+
+	chatID := strconv.FormatInt(primary.Chat.ID, 10)
+	metadata := map[string]any{
+		"username":   primary.From.Username,
+		"first_name": primary.From.FirstName,
+		"message_id": primary.MessageID,
+	}
+	t.bus.Inbound <- bus.InboundMessage{
+		Channel:       telegramChannelName,
+		SenderID:      strconv.FormatInt(primary.From.ID, 10),
+		ChatID:        chatID,
+		Content:       content,
+		Timestamp:     time.Unix(int64(primary.Date), 0),
+		ContentBlocks: allBlocks,
+		Metadata:      metadata,
+	}
+}
+// dispatchMessage extracts content from a single message and sends it to the bus.
+func (t *TelegramChannel) dispatchMessage(msg *telego.Message) {
 	content, blocks := t.extractContent(msg)
 	if content == "" && len(blocks) == 0 {
 		return
 	}
-
 	chatID := strconv.FormatInt(msg.Chat.ID, 10)
 	metadata := map[string]any{
 		"username":   msg.From.Username,
 		"first_name": msg.From.FirstName,
 		"message_id": msg.MessageID,
 	}
-
 	t.bus.Inbound <- bus.InboundMessage{
 		Channel:       telegramChannelName,
-		SenderID:      senderID,
+		SenderID:      strconv.FormatInt(msg.From.ID, 10),
 		ChatID:        chatID,
 		Content:       content,
-		Timestamp:      time.Unix(int64(msg.Date), 0),
+		Timestamp:     time.Unix(int64(msg.Date), 0),
 		ContentBlocks: blocks,
 		Metadata:      metadata,
 	}

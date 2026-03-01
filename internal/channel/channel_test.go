@@ -790,6 +790,65 @@ func TestTelegramChannel_HandleMessage_ForwardNoComment(t *testing.T) {
 	}
 }
 
+// === Media Group Tests ===
+func TestTelegramChannel_HandleMessage_MediaGroup(t *testing.T) {
+	ch, _ := newTestChannel(t, config.TelegramConfig{})
+	photoData := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0x00}
+	downloadServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(photoData)
+	}))
+	defer downloadServer.Close()
+	serverURL, err := url.Parse(downloadServer.URL)
+	if err != nil {
+		t.Fatalf("parse server url: %v", err)
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	ch.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		clonedReq := req.Clone(req.Context())
+		clonedReq.URL.Scheme = serverURL.Scheme
+		clonedReq.URL.Host = serverURL.Host
+		return transport.RoundTrip(clonedReq)
+	})}
+	// Simulate 3 photos in a media group (Telegram sends each as separate Message).
+	for i := 0; i < 3; i++ {
+		msg := &telego.Message{
+			From:         &telego.User{ID: 123},
+			Chat:         telego.Chat{ID: 456, Type: "private"},
+			Date:         1234567890,
+			MediaGroupID: "mg-abc-123",
+			Photo:        []telego.PhotoSize{{FileID: fmt.Sprintf("photo-%d", i)}},
+		}
+		if i == 0 {
+			msg.Caption = "album caption"
+		}
+		ch.handleMessage(msg)
+	}
+	// Should produce exactly ONE inbound message after flush.
+	select {
+	case inbound := <-ch.bus.Inbound:
+		if !strings.Contains(inbound.Content, "album caption") {
+			t.Errorf("missing caption, got: %q", inbound.Content)
+		}
+		if len(inbound.ContentBlocks) != 3 {
+			t.Fatalf("expected 3 content blocks (photos), got %d", len(inbound.ContentBlocks))
+		}
+		for i, block := range inbound.ContentBlocks {
+			if block.Type != model.ContentBlockImage {
+				t.Errorf("block[%d] type = %q, want image", i, block.Type)
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected exactly one inbound message from media group")
+	}
+	// Verify no second message arrives.
+	select {
+	case extra := <-ch.bus.Inbound:
+		t.Fatalf("unexpected second inbound message: %+v", extra)
+	case <-time.After(300 * time.Millisecond):
+		// Good — no duplicate.
+	}
+}
 // === WeChat Image Test (unchanged, no tgbotapi dependency) ===
 func TestWeComCallback_ImageMessage(t *testing.T) {
 	imageData := []byte{0xff, 0xd8, 0xff, 0xd9}
