@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/cexll/agentsdk-go/pkg/api"
@@ -36,21 +35,6 @@ type TelegramChannel struct {
 	feedback   string // "debug", "normal", "minimal", "silent"
 	streaming  bool
 	workspace  string // workspace root for file saving
-
-	// message batching: hold messages briefly to merge forwarded messages with preceding comments
-	pendingMu sync.Mutex
-	pending   map[string]*pendingMessage // chatID -> pending
-}
-
-// pendingMessage holds a message being batched before dispatch.
-type pendingMessage struct {
-	content       string
-	contentBlocks []model.ContentBlock
-	senderID      string
-	chatID        string
-	metadata      map[string]any
-	timestamp     time.Time
-	timer         *time.Timer
 }
 
 func NewTelegramChannel(cfg config.TelegramConfig, b *bus.MessageBus) (*TelegramChannel, error) {
@@ -68,7 +52,6 @@ func NewTelegramChannel(cfg config.TelegramConfig, b *bus.MessageBus) (*Telegram
 		httpClient:  http.DefaultClient,
 		feedback:    feedback,
 		streaming:   cfg.Streaming,
-		pending:     make(map[string]*pendingMessage),
 	}
 	return ch, nil
 }
@@ -154,82 +137,54 @@ func (t *TelegramChannel) handleMessage(msg *telego.Message) {
 		"message_id": msg.MessageID,
 	}
 
-	// Forwarded messages get merged into the preceding pending message.
-	// Normal messages flush any existing pending and start a new batch window.
-	isForwarded := msg.ForwardOrigin != nil
-	t.pendingMu.Lock()
-	if p, ok := t.pending[chatID]; ok {
-		// Append to existing pending message.
-		if content != "" {
-			if p.content != "" {
-				p.content += "\n" + content
-			} else {
-				p.content = content
-			}
-		}
-		p.contentBlocks = append(p.contentBlocks, blocks...)
-		// Extend timer on each forwarded message.
-		if isForwarded {
-			p.timer.Reset(1500 * time.Millisecond)
-		}
-		t.pendingMu.Unlock()
-		return
-	}
-	// No pending message — create one.
-	p := &pendingMessage{
-		content:       content,
-		contentBlocks: blocks,
-		senderID:      senderID,
-		chatID:        chatID,
-		metadata:      metadata,
-		timestamp:     time.Unix(int64(msg.Date), 0),
-	}
-	p.timer = time.AfterFunc(1500*time.Millisecond, func() {
-		t.flushPending(chatID)
-	})
-	t.pending[chatID] = p
-	t.pendingMu.Unlock()
-}
-
-// flushPending dispatches the batched message for a chat and removes it from the map.
-func (t *TelegramChannel) flushPending(chatID string) {
-	t.pendingMu.Lock()
-	p, ok := t.pending[chatID]
-	if !ok {
-		t.pendingMu.Unlock()
-		return
-	}
-	delete(t.pending, chatID)
-	t.pendingMu.Unlock()
-
 	t.bus.Inbound <- bus.InboundMessage{
 		Channel:       telegramChannelName,
-		SenderID:      p.senderID,
-		ChatID:        p.chatID,
-		Content:       p.content,
-		Timestamp:     p.timestamp,
-		ContentBlocks: p.contentBlocks,
-		Metadata:      p.metadata,
+		SenderID:      senderID,
+		ChatID:        chatID,
+		Content:       content,
+		Timestamp:      time.Unix(int64(msg.Date), 0),
+		ContentBlocks: blocks,
+		Metadata:      metadata,
 	}
 }
 
-// extractContent extracts text content, content blocks, and forward labels from a Telegram message.
+// extractContent extracts text content, content blocks, reply context, and forward hints from a Telegram message.
 func (t *TelegramChannel) extractContent(msg *telego.Message) (string, []model.ContentBlock) {
-	content := msg.Text
-	if content == "" {
-		content = msg.Caption
-	} else if msg.Caption != "" {
-		content = content + "\n" + msg.Caption
+	var parts []string
+	var blocks []model.ContentBlock
+	// Reply context: prepend the replied-to message as context.
+	// Three scenarios: ReplyToMessage (same chat), ExternalReply (cross-chat), Quote (text snippet).
+	if reply := msg.ReplyToMessage; reply != nil {
+		parts = append(parts, extractReplyContext(reply))
+	} else if msg.ExternalReply != nil || msg.Quote != nil {
+		extCtx, extBlocks := t.extractExternalReplyContext(msg.ExternalReply, msg.Quote)
+		parts = append(parts, extCtx)
+		blocks = append(blocks, extBlocks...)
 	}
-	// Prefix forwarded messages with origin label.
+
+	// Forwarded message: add origin label.
 	if label := forwardOriginLabel(msg); label != "" {
-		if content != "" {
-			content = label + "\n" + content
-		} else {
-			content = label
-		}
+		parts = append(parts, label)
 	}
-	blocks := make([]model.ContentBlock, 0, 2)
+
+	// Message body text.
+	body := msg.Text
+	if body == "" {
+		body = msg.Caption
+	} else if msg.Caption != "" {
+		body = body + "\n" + msg.Caption
+	}
+
+	// For standalone forwarded messages (no user text), hint the agent to summarize.
+	if msg.ForwardOrigin != nil && body == "" {
+		parts = append(parts, "[The user forwarded this message without comment. Summarize or process the content above.]")
+	}
+
+	if body != "" {
+		parts = append(parts, body)
+	}
+
+	content := strings.Join(parts, "\n")
 	// Photos: keep as image content blocks (LLMs can process these).
 	if len(msg.Photo) > 0 {
 		photo := msg.Photo[len(msg.Photo)-1]
@@ -329,6 +284,99 @@ func forwardOriginLabel(msg *telego.Message) string {
 	}
 }
 
+// extractReplyContext builds a context block from the replied-to message.
+func extractReplyContext(reply *telego.Message) string {
+	var b strings.Builder
+	b.WriteString("[Replying to")
+	if reply.From != nil {
+		name := strings.TrimSpace(reply.From.FirstName + " " + reply.From.LastName)
+		if name != "" {
+			b.WriteString(" " + name)
+		}
+	}
+	b.WriteString("]")
+	text := reply.Text
+	if text == "" {
+		text = reply.Caption
+	}
+	if text != "" {
+		b.WriteString("\n" + text)
+	}
+	if reply.Voice != nil {
+		b.WriteString("\n[Voice message]")
+	}
+	if reply.Audio != nil {
+		b.WriteString("\n[Audio: " + reply.Audio.FileName + "]")
+	}
+	if reply.Document != nil {
+		b.WriteString("\n[File: " + reply.Document.FileName + "]")
+	}
+	if len(reply.Photo) > 0 {
+		b.WriteString("\n[Photo]")
+	}
+	return b.String()
+}
+// extractExternalReplyContext builds context from cross-chat replies (ExternalReply + Quote).
+// Returns text context and optional image content blocks from the external reply.
+func (t *TelegramChannel) extractExternalReplyContext(ext *telego.ExternalReplyInfo, quote *telego.TextQuote) (string, []model.ContentBlock) {
+	var b strings.Builder
+	var blocks []model.ContentBlock
+	b.WriteString("[Replying to")
+	if ext != nil {
+		switch o := ext.Origin.(type) {
+		case *telego.MessageOriginUser:
+			name := strings.TrimSpace(o.SenderUser.FirstName + " " + o.SenderUser.LastName)
+			b.WriteString(" " + name)
+		case *telego.MessageOriginHiddenUser:
+			b.WriteString(" " + o.SenderUserName)
+		case *telego.MessageOriginChat:
+			b.WriteString(" chat: " + o.SenderChat.Title)
+		case *telego.MessageOriginChannel:
+			b.WriteString(" channel: " + o.Chat.Title)
+		}
+		// Photos: download and add as image content blocks.
+		if len(ext.Photo) > 0 {
+			photo := ext.Photo[len(ext.Photo)-1]
+			data, err := t.downloadFileData(photo.FileID)
+			if err != nil {
+				log.Printf("[telegram] download external reply photo failed: %v", err)
+				b.WriteString("\n[Photo, download failed]")
+			} else {
+				mediaType := http.DetectContentType(data)
+				if mediaType == "application/octet-stream" {
+					mediaType = "image/jpeg"
+				}
+				blocks = append(blocks, model.ContentBlock{
+					Type:      model.ContentBlockImage,
+					MediaType: mediaType,
+					Data:      base64.StdEncoding.EncodeToString(data),
+				})
+			}
+		}
+		// Non-image media: text indicators.
+		if ext.Voice != nil {
+			b.WriteString("\n[Voice message]")
+		}
+		if ext.Audio != nil {
+			b.WriteString("\n[Audio: " + ext.Audio.FileName + "]")
+		}
+		if ext.Document != nil {
+			b.WriteString("\n[File: " + ext.Document.FileName + "]")
+		}
+		if ext.Video != nil {
+			b.WriteString("\n[Video]")
+		}
+		if ext.Sticker != nil {
+			b.WriteString("\n[Sticker: " + ext.Sticker.Emoji + "]")
+		}
+	}
+	b.WriteString("]")
+	if quote != nil && quote.Text != "" {
+		b.WriteString("\n" + quote.Text)
+	}
+	return b.String(), blocks
+}
+
 // saveFile downloads a Telegram file and saves it to workspace/uploads/.
 // Returns the absolute path of the saved file.
 func (t *TelegramChannel) saveFile(fileID, name string) (string, error) {
@@ -388,22 +436,6 @@ func (t *TelegramChannel) downloadFileData(fileID string) ([]byte, error) {
 	return data, nil
 }
 func (t *TelegramChannel) Stop() error {
-	// Flush any pending batched messages.
-	t.pendingMu.Lock()
-	for chatID, p := range t.pending {
-		p.timer.Stop()
-		delete(t.pending, chatID)
-		t.bus.Inbound <- bus.InboundMessage{
-			Channel:       telegramChannelName,
-			SenderID:      p.senderID,
-			ChatID:        p.chatID,
-			Content:       p.content,
-			Timestamp:     p.timestamp,
-			ContentBlocks: p.contentBlocks,
-			Metadata:      p.metadata,
-		}
-	}
-	t.pendingMu.Unlock()
 	if t.cancel != nil {
 		t.cancel()
 	}

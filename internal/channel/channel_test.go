@@ -597,6 +597,199 @@ func TestTelegramChannel_HandleMessage_Document(t *testing.T) {
 		t.Error("expected inbound message")
 	}
 }
+
+// === Reply Context Tests ===
+func TestTelegramChannel_HandleMessage_ReplyContext(t *testing.T) {
+	b := bus.NewMessageBus(10)
+	ch, _ := NewTelegramChannel(config.TelegramConfig{Token: fakeToken}, b)
+	msg := &telego.Message{
+		From: &telego.User{ID: 123, Username: "testuser"},
+		Chat: telego.Chat{ID: 456, Type: "private"},
+		Text: "what does this mean?",
+		Date: 1234567890,
+		ReplyToMessage: &telego.Message{
+			From: &telego.User{ID: 789, FirstName: "Alice", LastName: "B"},
+			Text: "The quick brown fox jumps over the lazy dog",
+		},
+	}
+	ch.handleMessage(msg)
+	select {
+	case inbound := <-b.Inbound:
+		if !strings.Contains(inbound.Content, "[Replying to Alice B]") {
+			t.Errorf("missing reply context header, got: %q", inbound.Content)
+		}
+		if !strings.Contains(inbound.Content, "The quick brown fox") {
+			t.Errorf("missing replied-to text, got: %q", inbound.Content)
+		}
+		if !strings.Contains(inbound.Content, "what does this mean?") {
+			t.Errorf("missing user text, got: %q", inbound.Content)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("expected inbound message")
+	}
+}
+func TestTelegramChannel_HandleMessage_ReplyToPhoto(t *testing.T) {
+	b := bus.NewMessageBus(10)
+	ch, _ := NewTelegramChannel(config.TelegramConfig{Token: fakeToken}, b)
+	msg := &telego.Message{
+		From: &telego.User{ID: 123},
+		Chat: telego.Chat{ID: 456, Type: "private"},
+		Text: "describe this image",
+		Date: 1234567890,
+		ReplyToMessage: &telego.Message{
+			From:  &telego.User{ID: 789, FirstName: "Bob"},
+			Photo: []telego.PhotoSize{{FileID: "photo-1"}},
+		},
+	}
+	ch.handleMessage(msg)
+	select {
+	case inbound := <-b.Inbound:
+		if !strings.Contains(inbound.Content, "[Replying to Bob]") {
+			t.Errorf("missing reply header, got: %q", inbound.Content)
+		}
+		if !strings.Contains(inbound.Content, "[Photo]") {
+			t.Errorf("missing photo indicator, got: %q", inbound.Content)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("expected inbound message")
+	}
+}
+func TestTelegramChannel_HandleMessage_ExternalReply(t *testing.T) {
+	b := bus.NewMessageBus(10)
+	ch, _ := NewTelegramChannel(config.TelegramConfig{Token: fakeToken}, b)
+	msg := &telego.Message{
+		From: &telego.User{ID: 123},
+		Chat: telego.Chat{ID: 456, Type: "private"},
+		Text: "reply ping",
+		Date: 1234567890,
+		ExternalReply: &telego.ExternalReplyInfo{
+			Origin: &telego.MessageOriginChannel{
+				Chat: telego.Chat{Title: "Tech News"},
+			},
+		},
+		Quote: &telego.TextQuote{Text: "Breaking news content here"},
+	}
+	ch.handleMessage(msg)
+	select {
+	case inbound := <-b.Inbound:
+		if !strings.Contains(inbound.Content, "[Replying to channel: Tech News]") {
+			t.Errorf("missing external reply header, got: %q", inbound.Content)
+		}
+		if !strings.Contains(inbound.Content, "Breaking news content here") {
+			t.Errorf("missing quote text, got: %q", inbound.Content)
+		}
+		if !strings.Contains(inbound.Content, "reply ping") {
+			t.Errorf("missing user text, got: %q", inbound.Content)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("expected inbound message")
+	}
+}
+func TestTelegramChannel_HandleMessage_ExternalReplyWithPhoto(t *testing.T) {
+	ch, _ := newTestChannel(t, config.TelegramConfig{})
+	photoData := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0x00}
+	downloadServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(photoData)
+	}))
+	defer downloadServer.Close()
+	serverURL, err := url.Parse(downloadServer.URL)
+	if err != nil {
+		t.Fatalf("parse server url: %v", err)
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	ch.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		clonedReq := req.Clone(req.Context())
+		clonedReq.URL.Scheme = serverURL.Scheme
+		clonedReq.URL.Host = serverURL.Host
+		return transport.RoundTrip(clonedReq)
+	})}
+	msg := &telego.Message{
+		From: &telego.User{ID: 123},
+		Chat: telego.Chat{ID: 456, Type: "private"},
+		Text: "what is this image about",
+		Date: 1234567890,
+		ExternalReply: &telego.ExternalReplyInfo{
+			Origin: &telego.MessageOriginChannel{
+				Chat: telego.Chat{Title: "Linux.do 热门话题"},
+			},
+			Photo: []telego.PhotoSize{
+				{FileID: "ext-photo-small", Width: 76, Height: 998},
+				{FileID: "ext-photo-large", Width: 760, Height: 9980},
+			},
+		},
+		Quote: &telego.TextQuote{Text: "some quoted text"},
+	}
+	ch.handleMessage(msg)
+	select {
+	case inbound := <-ch.bus.Inbound:
+		if !strings.Contains(inbound.Content, "[Replying to channel: Linux.do 热门话题]") {
+			t.Errorf("missing external reply header, got: %q", inbound.Content)
+		}
+		if !strings.Contains(inbound.Content, "some quoted text") {
+			t.Errorf("missing quote text, got: %q", inbound.Content)
+		}
+		if len(inbound.ContentBlocks) != 1 {
+			t.Fatalf("expected 1 content block (photo), got %d", len(inbound.ContentBlocks))
+		}
+		if inbound.ContentBlocks[0].Type != model.ContentBlockImage {
+			t.Errorf("block type = %q, want image", inbound.ContentBlocks[0].Type)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("expected inbound message")
+	}
+}
+// === Forward Message Tests ===
+func TestTelegramChannel_HandleMessage_ForwardWithText(t *testing.T) {
+	b := bus.NewMessageBus(10)
+	ch, _ := NewTelegramChannel(config.TelegramConfig{Token: fakeToken}, b)
+	msg := &telego.Message{
+		From: &telego.User{ID: 123},
+		Chat: telego.Chat{ID: 456, Type: "private"},
+		Text: "Check this out",
+		Date: 1234567890,
+		ForwardOrigin: &telego.MessageOriginUser{
+			SenderUser: telego.User{FirstName: "Charlie", LastName: "D"},
+		},
+	}
+	ch.handleMessage(msg)
+	select {
+	case inbound := <-b.Inbound:
+		if !strings.Contains(inbound.Content, "[Forwarded from Charlie D]") {
+			t.Errorf("missing forward label, got: %q", inbound.Content)
+		}
+		if !strings.Contains(inbound.Content, "Check this out") {
+			t.Errorf("missing forwarded text, got: %q", inbound.Content)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("expected inbound message")
+	}
+}
+func TestTelegramChannel_HandleMessage_ForwardNoComment(t *testing.T) {
+	b := bus.NewMessageBus(10)
+	ch, _ := NewTelegramChannel(config.TelegramConfig{Token: fakeToken}, b)
+	msg := &telego.Message{
+		From: &telego.User{ID: 123},
+		Chat: telego.Chat{ID: 456, Type: "private"},
+		Date: 1234567890,
+		ForwardOrigin: &telego.MessageOriginChannel{
+			Chat: telego.Chat{Title: "Tech News"},
+		},
+	}
+	ch.handleMessage(msg)
+	select {
+	case inbound := <-b.Inbound:
+		if !strings.Contains(inbound.Content, "[Forwarded from channel: Tech News]") {
+			t.Errorf("missing forward label, got: %q", inbound.Content)
+		}
+		if !strings.Contains(inbound.Content, "Summarize or process") {
+			t.Errorf("missing summarize hint, got: %q", inbound.Content)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("expected inbound message")
+	}
+}
+
 // === WeChat Image Test (unchanged, no tgbotapi dependency) ===
 func TestWeComCallback_ImageMessage(t *testing.T) {
 	imageData := []byte{0xff, 0xd8, 0xff, 0xd9}
