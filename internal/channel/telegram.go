@@ -712,6 +712,12 @@ type statusCard struct {
 	toolIndex map[string]int // toolUseID -> index in tools
 }
 
+type streamMsg struct {
+	id       int
+	dirty    bool
+	lastEdit time.Time
+}
+
 func newStatusCard() *statusCard {
 	return &statusCard{
 		started:   time.Now(),
@@ -813,14 +819,10 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 	// 1) status card message: tool/status progress
 	// 2) content message: intermediate text deltas
 	// They are updated independently and removed when final report is sent.
-	var statusMsgID int
-	var contentMsgID int
+	var statusMsg streamMsg
+	var contentMsg streamMsg
 	var textBuf strings.Builder
-	var lastStatusEdit time.Time
-	var lastContentEdit time.Time
 	var lastOp time.Time
-	var statusDirty bool
-	var contentDirty bool
 	const (
 		opMinInterval        = 700 * time.Millisecond
 		contentEditInterval  = 1 * time.Second
@@ -835,93 +837,73 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 	var pendingToolInput map[string][]byte // toolUseID -> accumulated JSON
 	var blockToolID string                 // current content_block's tool_use_id
 
-	ensureStatusMessage := func() {
-		if !showCard || statusMsgID != 0 {
-			return
-		}
-		pid, err := t.sendPlaceholder(numChatID, card.render(), telego.ModeHTML, true)
-		if err != nil {
-			log.Printf("[telegram] status placeholder failed: %v", err)
-			return
-		}
-		statusMsgID = pid
-		now := time.Now()
-		lastStatusEdit = now
-		lastOp = now
-	}
-	editStatus := func(now time.Time) bool {
-		if !showCard || statusMsgID == 0 {
-			return false
-		}
-		if err := t.editMessage(numChatID, statusMsgID, card.render(), telego.ModeHTML); err != nil {
-			log.Printf("[telegram] card edit failed: %v", err)
-			return false
-		}
-		lastStatusEdit = now
-		lastOp = now
-		statusDirty = false
-		return true
-	}
-	editContent := func(now time.Time) bool {
-		text := textBuf.String()
+	upsertMessage := func(msg *streamMsg, text, parseMode string, silent bool, now time.Time) bool {
 		if text == "" {
 			return false
 		}
-		if showCursor {
-			text += "▍"
-		}
-		htmlText := toTelegramHTML(text)
-		if contentMsgID == 0 {
-			pid, err := t.sendPlaceholder(numChatID, htmlText, telego.ModeHTML, true)
+		if msg.id == 0 {
+			pid, err := t.sendPlaceholder(numChatID, text, parseMode, silent)
 			if err != nil {
-				log.Printf("[telegram] content placeholder failed: %v", err)
+				log.Printf("[telegram] stream placeholder failed: %v", err)
 				return false
 			}
-			contentMsgID = pid
+			msg.id = pid
 		} else {
-			if err := t.editMessage(numChatID, contentMsgID, htmlText, telego.ModeHTML); err != nil {
+			if err := t.editMessage(numChatID, msg.id, text, parseMode); err != nil {
 				log.Printf("[telegram] stream edit failed: %v", err)
 				return false
 			}
 		}
-		lastContentEdit = now
+		msg.lastEdit = now
+		msg.dirty = false
 		lastOp = now
-		contentDirty = false
 		return true
 	}
-	tryFlush := func(now time.Time) {
+
+	renderContent := func() string {
+		text := textBuf.String()
+		if text == "" {
+			return ""
+		}
+		if showCursor {
+			text += "▍"
+		}
+		return toTelegramHTML(text)
+	}
+
+	flush := func(now time.Time) {
 		if !lastOp.IsZero() && now.Sub(lastOp) < opMinInterval {
 			return
 		}
-		contentDue := contentDirty && contentMsgID != 0 && (lastContentEdit.IsZero() || now.Sub(lastContentEdit) >= contentEditInterval)
-		statusDue := statusDirty && statusMsgID != 0 && (lastStatusEdit.IsZero() || now.Sub(lastStatusEdit) >= statusEditInterval)
+		contentDue := contentMsg.dirty && (contentMsg.lastEdit.IsZero() || now.Sub(contentMsg.lastEdit) >= contentEditInterval)
+		statusDue := showCard && statusMsg.dirty && (statusMsg.lastEdit.IsZero() || now.Sub(statusMsg.lastEdit) >= statusEditInterval)
 		if contentDue && statusDue {
-			if lastStatusEdit.Before(lastContentEdit) {
-				if editStatus(now) {
+			if statusMsg.lastEdit.Before(contentMsg.lastEdit) {
+				if upsertMessage(&statusMsg, card.render(), telego.ModeHTML, true, now) {
 					return
 				}
-				_ = editContent(now)
+				_ = upsertMessage(&contentMsg, renderContent(), telego.ModeHTML, true, now)
 				return
 			}
-			if editContent(now) {
+			if upsertMessage(&contentMsg, renderContent(), telego.ModeHTML, true, now) {
 				return
 			}
-			_ = editStatus(now)
+			_ = upsertMessage(&statusMsg, card.render(), telego.ModeHTML, true, now)
 			return
 		}
 		if contentDue {
-			if editContent(now) {
+			if upsertMessage(&contentMsg, renderContent(), telego.ModeHTML, true, now) {
 				return
 			}
 		}
 		if statusDue {
-			if editStatus(now) {
+			if upsertMessage(&statusMsg, card.render(), telego.ModeHTML, true, now) {
 				return
 			}
 		}
 		// Heartbeat update keeps elapsed time fresh even without state transitions.
-		if showCard && statusMsgID != 0 && (lastStatusEdit.IsZero() || now.Sub(lastStatusEdit) >= statusHeartbeatDelay) {
-			_ = editStatus(now)
+		if showCard && statusMsg.id != 0 && (statusMsg.lastEdit.IsZero() || now.Sub(statusMsg.lastEdit) >= statusHeartbeatDelay) {
+			_ = upsertMessage(&statusMsg, card.render(), telego.ModeHTML, true, now)
 		}
 	}
 
@@ -932,7 +914,7 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			tryFlush(time.Now())
+			flush(time.Now())
 		case event, ok := <-events:
 			if !ok {
 				events = nil
@@ -946,13 +928,12 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 				if event.Iteration != nil {
 					card.iteration = *event.Iteration + 1
 				}
-				ensureStatusMessage()
-				statusDirty = true
+				statusMsg.dirty = true
 				// New iteration: discard stale intermediate text.
 				if textBuf.Len() > 0 {
 					textBuf.Reset()
-					if contentMsgID != 0 {
-						contentDirty = true
+					if contentMsg.id != 0 {
+						contentMsg.dirty = true
 					}
 				}
 
@@ -985,29 +966,18 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 				// Text delta updates content message only.
 				if event.Delta.Text != "" {
 					textBuf.WriteString(event.Delta.Text)
-					if contentMsgID == 0 {
-						text := textBuf.String()
-						if showCursor {
-							text += "▍"
-						}
-						pid, err := t.sendPlaceholder(numChatID, toTelegramHTML(text), telego.ModeHTML, true)
-						if err != nil {
-							log.Printf("[telegram] content placeholder failed: %v", err)
-							contentDirty = true
-						} else {
-							contentMsgID = pid
-							now := time.Now()
-							lastContentEdit = now
-							lastOp = now
-							contentDirty = false
+					if contentMsg.id == 0 {
+						now := time.Now()
+						if !upsertMessage(&contentMsg, renderContent(), telego.ModeHTML, true, now) {
+							contentMsg.dirty = true
 						}
 						continue
 					}
-					contentDirty = true
+					contentMsg.dirty = true
 				}
 
 			case api.EventToolExecutionStart:
-				ensureStatusMessage()
+				statusMsg.dirty = true
 				// Extract tool input summary from accumulated JSON.
 				var summary string
 				if pendingToolInput != nil {
@@ -1017,23 +987,20 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 					}
 				}
 				card.addTool(event.ToolUseID, event.Name, summary)
-				statusDirty = true
 
 			case api.EventToolExecutionResult:
-				ensureStatusMessage()
+				statusMsg.dirty = true
 				failed := false
 				if event.IsError != nil && *event.IsError {
 					failed = true
 				}
 				card.finishTool(event.ToolUseID, failed)
-				statusDirty = true
 
 			case api.EventError:
 				log.Printf("[telegram] stream error: %s", event.Output)
-				ensureStatusMessage()
-				statusDirty = true
+				statusMsg.dirty = true
 			}
-			tryFlush(time.Now())
+			flush(time.Now())
 		}
 	}
 
@@ -1044,13 +1011,13 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 	}
 
 	// Remove intermediate status/content messages before sending final report.
-	if statusMsgID != 0 {
-		if err := t.deleteMessage(numChatID, statusMsgID); err != nil {
+	if statusMsg.id != 0 {
+		if err := t.deleteMessage(numChatID, statusMsg.id); err != nil {
 			log.Printf("[telegram] delete status message failed: %v", err)
 		}
 	}
-	if contentMsgID != 0 {
-		if err := t.deleteMessage(numChatID, contentMsgID); err != nil {
+	if contentMsg.id != 0 {
+		if err := t.deleteMessage(numChatID, contentMsg.id); err != nil {
 			log.Printf("[telegram] delete content message failed: %v", err)
 		}
 	}
