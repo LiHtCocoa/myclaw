@@ -1030,14 +1030,10 @@ func TestTelegramChannel_SendStream_PureText(t *testing.T) {
 			deleteCount++
 		}
 	}
-	if sendCount < 2 {
-		t.Errorf("expected at least 2 sendMessage calls (intermediate + final), got %d", sendCount)
-	}
-	if deleteCount == 0 {
-		t.Error("expected deleteMessage call to clean intermediate message")
-	}
-	if silentSend == 0 {
-		t.Error("expected intermediate message to be sent with disable_notification=true")
+	// Content message is now ticker-driven (not created on first delta),
+	// so with synchronous events only the final report is sent.
+	if sendCount < 1 {
+		t.Errorf("expected at least 1 sendMessage call (final), got %d", sendCount)
 	}
 	if normalSend == 0 {
 		t.Error("expected final report to be sent as a normal notification message")
@@ -1079,14 +1075,16 @@ func TestTelegramChannel_SendStream_WithTools(t *testing.T) {
 			deleteCount++
 		}
 	}
-	if sendCount < 3 {
-		t.Errorf("expected at least 3 sendMessage calls (status + content + final), got %d", sendCount)
+	// Status card is event-driven; content message is ticker-driven.
+	// With synchronous events, only status card + final report are sent.
+	if sendCount < 2 {
+		t.Errorf("expected at least 2 sendMessage calls (status + final), got %d", sendCount)
 	}
-	if deleteCount < 2 {
-		t.Errorf("expected at least 2 deleteMessage calls for intermediate cleanup, got %d", deleteCount)
+	if deleteCount < 1 {
+		t.Errorf("expected at least 1 deleteMessage call for status cleanup, got %d", deleteCount)
 	}
-	if silentSend < 2 {
-		t.Errorf("expected at least 2 silent intermediate messages, got %d", silentSend)
+	if silentSend < 1 {
+		t.Errorf("expected at least 1 silent intermediate message, got %d", silentSend)
 	}
 	if normalSend == 0 {
 		t.Error("expected final report to be sent as a normal notification message")

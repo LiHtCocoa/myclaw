@@ -822,12 +822,10 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 	var statusMsg streamMsg
 	var contentMsg streamMsg
 	var textBuf strings.Builder
-	var lastOp time.Time
 	const (
-		opMinInterval        = 700 * time.Millisecond
-		contentEditInterval  = 1 * time.Second
-		statusEditInterval   = 1200 * time.Millisecond
-		statusHeartbeatDelay = 4 * time.Second
+		statusMinGap         = 500 * time.Millisecond
+		contentMinGap        = 1 * time.Second
+		statusHeartbeatDelay = 5 * time.Second
 	)
 	card := newStatusCard()
 	showCard := t.feedback == "debug" || t.feedback == "normal"
@@ -856,7 +854,6 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 		}
 		msg.lastEdit = now
 		msg.dirty = false
-		lastOp = now
 		return true
 	}
 
@@ -871,39 +868,28 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 		return toTelegramHTML(text)
 	}
 
-	flush := func(now time.Time) {
-		if !lastOp.IsZero() && now.Sub(lastOp) < opMinInterval {
+	// Event-driven: update status card immediately, with per-message rate limit.
+	tryUpdateStatus := func(now time.Time) {
+		if !showCard {
 			return
 		}
-		contentDue := contentMsg.dirty && (contentMsg.lastEdit.IsZero() || now.Sub(contentMsg.lastEdit) >= contentEditInterval)
-		statusDue := showCard && statusMsg.dirty && (statusMsg.lastEdit.IsZero() || now.Sub(statusMsg.lastEdit) >= statusEditInterval)
-		if contentDue && statusDue {
-			if statusMsg.lastEdit.Before(contentMsg.lastEdit) {
-				if upsertMessage(&statusMsg, card.render(), telego.ModeHTML, true, now) {
-					return
-				}
-				_ = upsertMessage(&contentMsg, renderContent(), telego.ModeHTML, true, now)
-				return
-			}
-			if upsertMessage(&contentMsg, renderContent(), telego.ModeHTML, true, now) {
-				return
-			}
-			_ = upsertMessage(&statusMsg, card.render(), telego.ModeHTML, true, now)
+		if !statusMsg.lastEdit.IsZero() && now.Sub(statusMsg.lastEdit) < statusMinGap {
+			statusMsg.dirty = true // deferred to ticker
 			return
 		}
-		if contentDue {
-			if upsertMessage(&contentMsg, renderContent(), telego.ModeHTML, true, now) {
-				return
-			}
+		upsertMessage(&statusMsg, card.render(), telego.ModeHTML, true, now)
+	}
+
+	// Ticker-driven: deferred status + content + heartbeat.
+	tickFlush := func(now time.Time) {
+		if showCard && statusMsg.dirty && (statusMsg.lastEdit.IsZero() || now.Sub(statusMsg.lastEdit) >= statusMinGap) {
+			upsertMessage(&statusMsg, card.render(), telego.ModeHTML, true, now)
 		}
-		if statusDue {
-			if upsertMessage(&statusMsg, card.render(), telego.ModeHTML, true, now) {
-				return
-			}
+		if contentMsg.dirty && (contentMsg.lastEdit.IsZero() || now.Sub(contentMsg.lastEdit) >= contentMinGap) {
+			upsertMessage(&contentMsg, renderContent(), telego.ModeHTML, true, now)
 		}
-		// Heartbeat update keeps elapsed time fresh even without state transitions.
-		if showCard && statusMsg.id != 0 && (statusMsg.lastEdit.IsZero() || now.Sub(statusMsg.lastEdit) >= statusHeartbeatDelay) {
-			_ = upsertMessage(&statusMsg, card.render(), telego.ModeHTML, true, now)
+		if showCard && statusMsg.id != 0 && !statusMsg.dirty && (statusMsg.lastEdit.IsZero() || now.Sub(statusMsg.lastEdit) >= statusHeartbeatDelay) {
+			upsertMessage(&statusMsg, card.render(), telego.ModeHTML, true, now)
 		}
 	}
 
@@ -914,7 +900,7 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			flush(time.Now())
+			tickFlush(time.Now())
 		case event, ok := <-events:
 			if !ok {
 				events = nil
@@ -928,17 +914,12 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 				if event.Iteration != nil {
 					card.iteration = *event.Iteration + 1
 				}
-				statusMsg.dirty = true
-				// New iteration: discard stale intermediate text.
 				if textBuf.Len() > 0 {
 					textBuf.Reset()
-					if contentMsg.id != 0 {
-						contentMsg.dirty = true
-					}
 				}
+				tryUpdateStatus(time.Now())
 
 			case api.EventContentBlockStart:
-				// Track tool_use blocks so we can accumulate their input JSON.
 				if event.ContentBlock != nil && event.ContentBlock.Type == "tool_use" {
 					blockToolID = event.ContentBlock.ID
 				} else {
@@ -952,7 +933,6 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 				if event.Delta == nil {
 					continue
 				}
-				// Tool input JSON accumulation.
 				if event.Delta.Type == "input_json_delta" && blockToolID != "" {
 					if pendingToolInput == nil {
 						pendingToolInput = make(map[string][]byte)
@@ -963,22 +943,12 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 					}
 					continue
 				}
-				// Text delta updates content message only.
 				if event.Delta.Text != "" {
 					textBuf.WriteString(event.Delta.Text)
-					if contentMsg.id == 0 {
-						now := time.Now()
-						if !upsertMessage(&contentMsg, renderContent(), telego.ModeHTML, true, now) {
-							contentMsg.dirty = true
-						}
-						continue
-					}
 					contentMsg.dirty = true
 				}
 
 			case api.EventToolExecutionStart:
-				statusMsg.dirty = true
-				// Extract tool input summary from accumulated JSON.
 				var summary string
 				if pendingToolInput != nil {
 					if raw, ok := pendingToolInput[event.ToolUseID]; ok {
@@ -987,20 +957,20 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 					}
 				}
 				card.addTool(event.ToolUseID, event.Name, summary)
+				tryUpdateStatus(time.Now())
 
 			case api.EventToolExecutionResult:
-				statusMsg.dirty = true
 				failed := false
 				if event.IsError != nil && *event.IsError {
 					failed = true
 				}
 				card.finishTool(event.ToolUseID, failed)
+				tryUpdateStatus(time.Now())
 
 			case api.EventError:
 				log.Printf("[telegram] stream error: %s", event.Output)
-				statusMsg.dirty = true
+				tryUpdateStatus(time.Now())
 			}
-			flush(time.Now())
 		}
 	}
 
