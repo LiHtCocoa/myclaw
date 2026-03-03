@@ -822,6 +822,7 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 	var statusMsg streamMsg
 	var contentMsg streamMsg
 	var textBuf strings.Builder
+	var streamErr string
 	const (
 		statusMinGap         = 500 * time.Millisecond
 		contentMinGap        = 1 * time.Second
@@ -968,7 +969,8 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 				tryUpdateStatus(time.Now())
 
 			case api.EventError:
-				log.Printf("[telegram] stream error: %s", event.Output)
+				streamErr = strings.TrimSpace(fmt.Sprintf("%v", event.Output))
+				log.Printf("[telegram] stream error: %s", streamErr)
 				tryUpdateStatus(time.Now())
 			}
 		}
@@ -977,7 +979,11 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 	// Final output
 	finalText := textBuf.String()
 	if finalText == "" {
-		finalText = "agent return null"
+		if streamErr != "" {
+			finalText = "stream failed: " + streamErr
+		} else {
+			finalText = "agent return null"
+		}
 	}
 
 	// Remove intermediate status/content messages before sending final report.

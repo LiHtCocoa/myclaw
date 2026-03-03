@@ -1109,3 +1109,37 @@ func TestTelegramChannel_SendStream_Disabled(t *testing.T) {
 		t.Error("expected sendMessage for non-streaming mode")
 	}
 }
+
+func TestTelegramChannel_SendStream_ErrorVisibility(t *testing.T) {
+	ch, caller := newTestChannel(t, config.TelegramConfig{Streaming: true, Feedback: "normal"})
+	events := make(chan api.StreamEvent, 5)
+	events <- api.StreamEvent{Type: api.EventError, Output: "unexpected end of JSON input"}
+	close(events)
+
+	if err := ch.SendStream(context.Background(), "123", nil, events); err != nil {
+		t.Fatalf("SendStream error: %v", err)
+	}
+
+	finalText := ""
+	for i := len(caller.calls) - 1; i >= 0; i-- {
+		c := caller.calls[i]
+		if !strings.HasSuffix(c.URL, "/sendMessage") || c.Data == nil || len(c.Data.BodyRaw) == 0 {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(c.Data.BodyRaw, &payload); err != nil {
+			continue
+		}
+		if text, ok := payload["text"].(string); ok {
+			finalText = text
+			break
+		}
+	}
+
+	if !strings.Contains(finalText, "stream failed: unexpected end of JSON input") {
+		t.Fatalf("final message = %q, want stream error visible", finalText)
+	}
+	if strings.Contains(finalText, "agent return null") {
+		t.Fatalf("final message should not fallback to null, got %q", finalText)
+	}
+}
