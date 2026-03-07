@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"github.com/mymmrac/telego"
 	tu "github.com/mymmrac/telego/telegoutil"
 	"github.com/stellarlinkco/myclaw/internal/bus"
+	"github.com/stellarlinkco/myclaw/internal/channel/telegram"
 	"github.com/stellarlinkco/myclaw/internal/config"
 )
 
@@ -42,6 +44,8 @@ type TelegramChannel struct {
 	// before merging into a single dispatch.
 	mgMu     sync.Mutex
 	mgBuffer map[string]*mediaGroup
+
+	slashCommands map[string]telegram.Command
 }
 
 func NewTelegramChannel(cfg config.TelegramConfig, b *bus.MessageBus) (*TelegramChannel, error) {
@@ -102,6 +106,7 @@ func (t *TelegramChannel) Start(ctx context.Context) error {
 	if err := t.initBot(); err != nil {
 		return err
 	}
+	t.loadSlashCommands()
 
 	ctx, t.cancel = context.WithCancel(ctx)
 
@@ -228,6 +233,10 @@ func (t *TelegramChannel) flushMediaGroup(gid string) {
 
 // dispatchMessage extracts content from a single message and sends it to the bus.
 func (t *TelegramChannel) dispatchMessage(msg *telego.Message) {
+	if t.isSlashCommand(msg) {
+		t.handleSlashCommand(msg)
+		return
+	}
 	content, blocks := t.extractContent(msg)
 	if content == "" && len(blocks) == 0 {
 		return
@@ -256,7 +265,7 @@ func (t *TelegramChannel) extractContent(msg *telego.Message) (string, []model.C
 	// Reply context: prepend the replied-to message as context.
 	// Three scenarios: ReplyToMessage (same chat), ExternalReply (cross-chat), Quote (text snippet).
 	if reply := msg.ReplyToMessage; reply != nil {
-		parts = append(parts, extractReplyContext(reply))
+		parts = append(parts, telegram.ExtractReplyContext(reply))
 	} else if msg.ExternalReply != nil || msg.Quote != nil {
 		extCtx, extBlocks := t.extractExternalReplyContext(msg.ExternalReply, msg.Quote)
 		parts = append(parts, extCtx)
@@ -264,7 +273,7 @@ func (t *TelegramChannel) extractContent(msg *telego.Message) (string, []model.C
 	}
 
 	// Forwarded message: add origin label.
-	if label := forwardOriginLabel(msg); label != "" {
+	if label := telegram.ForwardOriginLabel(msg); label != "" {
 		parts = append(parts, label)
 	}
 
@@ -308,9 +317,9 @@ func (t *TelegramChannel) extractContent(msg *telego.Message) (string, []model.C
 	if msg.Voice != nil {
 		if path, err := t.saveFile(msg.Voice.FileID, "voice.ogg"); err != nil {
 			log.Printf("[telegram] save voice failed: %v", err)
-			content = appendLine(content, fmt.Sprintf("[Voice message, %ds, download failed]", msg.Voice.Duration))
+			content = telegram.AppendLine(content, fmt.Sprintf("[Voice message, %ds, download failed]", msg.Voice.Duration))
 		} else {
-			content = appendLine(content, "[Voice message saved to: "+path+"]")
+			content = telegram.AppendLine(content, "[Voice message saved to: "+path+"]")
 		}
 	}
 	if msg.Audio != nil {
@@ -320,9 +329,9 @@ func (t *TelegramChannel) extractContent(msg *telego.Message) (string, []model.C
 		}
 		if path, err := t.saveFile(msg.Audio.FileID, name); err != nil {
 			log.Printf("[telegram] save audio failed: %v", err)
-			content = appendLine(content, fmt.Sprintf("[Audio: %s, download failed]", name))
+			content = telegram.AppendLine(content, fmt.Sprintf("[Audio: %s, download failed]", name))
 		} else {
-			content = appendLine(content, "[Audio file saved to: "+path+"]")
+			content = telegram.AppendLine(content, "[Audio file saved to: "+path+"]")
 		}
 	}
 	if msg.Video != nil {
@@ -332,9 +341,9 @@ func (t *TelegramChannel) extractContent(msg *telego.Message) (string, []model.C
 		}
 		if path, err := t.saveFile(msg.Video.FileID, name); err != nil {
 			log.Printf("[telegram] save video failed: %v", err)
-			content = appendLine(content, fmt.Sprintf("[Video: %s, download failed]", name))
+			content = telegram.AppendLine(content, fmt.Sprintf("[Video: %s, download failed]", name))
 		} else {
-			content = appendLine(content, "[Video file saved to: "+path+"]")
+			content = telegram.AppendLine(content, "[Video file saved to: "+path+"]")
 		}
 	}
 	if msg.Document != nil {
@@ -347,7 +356,7 @@ func (t *TelegramChannel) extractContent(msg *telego.Message) (string, []model.C
 			data, err := t.downloadFileData(msg.Document.FileID)
 			if err != nil {
 				log.Printf("[telegram] download document %s failed: %v", msg.Document.FileID, err)
-				content = appendLine(content, fmt.Sprintf("[Image document: %s (%s), download failed]", name, mediaType))
+				content = telegram.AppendLine(content, fmt.Sprintf("[Image document: %s (%s), download failed]", name, mediaType))
 			} else {
 				blocks = append(blocks, model.ContentBlock{
 					Type:      model.ContentBlockImage,
@@ -363,9 +372,9 @@ func (t *TelegramChannel) extractContent(msg *telego.Message) (string, []model.C
 					info += fmt.Sprintf(", %d bytes", msg.Document.FileSize)
 				}
 				info += ", download failed]"
-				content = appendLine(content, info)
+				content = telegram.AppendLine(content, info)
 			} else {
-				content = appendLine(content, "[File saved to: "+path+"]")
+				content = telegram.AppendLine(content, "[File saved to: "+path+"]")
 			}
 		}
 	}
@@ -373,57 +382,6 @@ func (t *TelegramChannel) extractContent(msg *telego.Message) (string, []model.C
 }
 
 // forwardOriginLabel returns a label like "[Forwarded from UserName]" for forwarded messages.
-func forwardOriginLabel(msg *telego.Message) string {
-	if msg.ForwardOrigin == nil {
-		return ""
-	}
-	switch o := msg.ForwardOrigin.(type) {
-	case *telego.MessageOriginUser:
-		name := strings.TrimSpace(o.SenderUser.FirstName + " " + o.SenderUser.LastName)
-		return "[Forwarded from " + name + "]"
-	case *telego.MessageOriginHiddenUser:
-		return "[Forwarded from " + o.SenderUserName + "]"
-	case *telego.MessageOriginChat:
-		return "[Forwarded from chat: " + o.SenderChat.Title + "]"
-	case *telego.MessageOriginChannel:
-		return "[Forwarded from channel: " + o.Chat.Title + "]"
-	default:
-		return "[Forwarded message]"
-	}
-}
-
-// extractReplyContext builds a context block from the replied-to message.
-func extractReplyContext(reply *telego.Message) string {
-	var b strings.Builder
-	b.WriteString("[Replying to")
-	if reply.From != nil {
-		name := strings.TrimSpace(reply.From.FirstName + " " + reply.From.LastName)
-		if name != "" {
-			b.WriteString(" " + name)
-		}
-	}
-	b.WriteString("]")
-	text := reply.Text
-	if text == "" {
-		text = reply.Caption
-	}
-	if text != "" {
-		b.WriteString("\n" + text)
-	}
-	if reply.Voice != nil {
-		b.WriteString("\n[Voice message]")
-	}
-	if reply.Audio != nil {
-		b.WriteString("\n[Audio: " + reply.Audio.FileName + "]")
-	}
-	if reply.Document != nil {
-		b.WriteString("\n[File: " + reply.Document.FileName + "]")
-	}
-	if len(reply.Photo) > 0 {
-		b.WriteString("\n[Photo]")
-	}
-	return b.String()
-}
 
 // extractExternalReplyContext builds context from cross-chat replies (ExternalReply + Quote).
 // Returns text context and optional image content blocks from the external reply.
@@ -510,12 +468,6 @@ func (t *TelegramChannel) saveFile(fileID, name string) (string, error) {
 	return path, nil
 }
 
-func appendLine(s, line string) string {
-	if s == "" {
-		return line
-	}
-	return s + "\n" + line
-}
 func (t *TelegramChannel) downloadFileData(fileID string) ([]byte, error) {
 	if t.bot == nil {
 		return nil, fmt.Errorf("telegram bot not initialized")
@@ -655,7 +607,7 @@ func (t *TelegramChannel) Send(msg bus.OutboundMessage) error {
 	// Check if we should edit a placeholder instead of sending new message
 	if placeholderID, ok := msg.Metadata["placeholder_id"]; ok {
 		if pid, ok := placeholderID.(int); ok && pid != 0 {
-			content := toTelegramHTML(msg.Content)
+			content := telegram.ToTelegramHTML(msg.Content)
 			if err := t.editMessage(chatID, pid, content, telego.ModeHTML); err != nil {
 				log.Printf("[telegram] edit placeholder failed: %v", err)
 			} else {
@@ -663,7 +615,7 @@ func (t *TelegramChannel) Send(msg bus.OutboundMessage) error {
 			}
 		}
 	}
-	content := toTelegramHTML(msg.Content)
+	content := telegram.ToTelegramHTML(msg.Content)
 	const maxLen = 4000
 	for len(content) > 0 {
 		chunk := content
@@ -691,105 +643,10 @@ func (t *TelegramChannel) Send(msg bus.OutboundMessage) error {
 
 // --- Status Card for streaming feedback ---
 
-type toolStatus int
-
-const (
-	toolRunning toolStatus = iota
-	toolDone
-	toolError
-)
-
-type toolEntry struct {
-	name    string
-	summary string
-	status  toolStatus
-}
-
-type statusCard struct {
-	tools     []toolEntry
-	started   time.Time
-	iteration int
-	toolIndex map[string]int // toolUseID -> index in tools
-}
-
 type streamMsg struct {
 	id       int
 	dirty    bool
 	lastEdit time.Time
-}
-
-func newStatusCard() *statusCard {
-	return &statusCard{
-		started:   time.Now(),
-		toolIndex: make(map[string]int),
-	}
-}
-
-func (c *statusCard) addTool(toolUseID, name, summary string) {
-	c.toolIndex[toolUseID] = len(c.tools)
-	c.tools = append(c.tools, toolEntry{name: name, summary: summary, status: toolRunning})
-}
-
-func (c *statusCard) finishTool(toolUseID string, failed bool) {
-	if idx, ok := c.toolIndex[toolUseID]; ok {
-		if failed {
-			c.tools[idx].status = toolError
-		} else {
-			c.tools[idx].status = toolDone
-		}
-	}
-}
-
-func (c *statusCard) render() string {
-	var b strings.Builder
-	b.WriteString("🤖 <b>Working...</b>\n")
-	if c.iteration > 0 {
-		fmt.Fprintf(&b, "\n🔄 Iteration %d\n", c.iteration)
-	}
-	if len(c.tools) > 0 {
-		b.WriteString("\n")
-		for _, t := range c.tools {
-			var icon string
-			switch t.status {
-			case toolRunning:
-				icon = "⏳"
-			case toolDone:
-				icon = "✅"
-			case toolError:
-				icon = "❌"
-			}
-			if t.summary != "" {
-				fmt.Fprintf(&b, "%s <code>%s</code>(%s)\n", icon, escapeHTML(t.name), escapeHTML(t.summary))
-			} else {
-				fmt.Fprintf(&b, "%s <code>%s</code>\n", icon, escapeHTML(t.name))
-			}
-		}
-	}
-	elapsed := time.Since(c.started).Truncate(time.Second)
-	fmt.Fprintf(&b, "\n⏱ %s", elapsed)
-	return b.String()
-}
-
-// summarizeToolInput extracts a short description from a tool's input JSON.
-func summarizeToolInput(name string, input json.RawMessage) string {
-	if len(input) == 0 {
-		return ""
-	}
-	var m map[string]any
-	if json.Unmarshal(input, &m) != nil {
-		return ""
-	}
-	// Pick the most meaningful field per tool type
-	for _, key := range []string{"filePath", "file_path", "path", "command", "query", "pattern", "url"} {
-		if v, ok := m[key]; ok {
-			s := fmt.Sprintf("%v", v)
-			if len(s) > 40 {
-				s = s[:37] + "..."
-			}
-			return s
-		}
-	}
-	return ""
 }
 
 // SendStream implements streaming output for TelegramChannel.
@@ -828,7 +685,7 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 		contentMinGap        = 1 * time.Second
 		statusHeartbeatDelay = 5 * time.Second
 	)
-	card := newStatusCard()
+	card := telegram.NewStatusCard()
 	showCard := t.feedback == "debug" || t.feedback == "normal"
 	showCursor := t.feedback != "silent"
 
@@ -866,7 +723,7 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 		if showCursor {
 			text += "▍"
 		}
-		return toTelegramHTML(text)
+		return telegram.ToTelegramHTML(text)
 	}
 
 	// Event-driven: update status card immediately, with per-message rate limit.
@@ -878,19 +735,19 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 			statusMsg.dirty = true // deferred to ticker
 			return
 		}
-		upsertMessage(&statusMsg, card.render(), telego.ModeHTML, true, now)
+		upsertMessage(&statusMsg, card.Render(), telego.ModeHTML, true, now)
 	}
 
 	// Ticker-driven: deferred status + content + heartbeat.
 	tickFlush := func(now time.Time) {
 		if showCard && statusMsg.dirty && (statusMsg.lastEdit.IsZero() || now.Sub(statusMsg.lastEdit) >= statusMinGap) {
-			upsertMessage(&statusMsg, card.render(), telego.ModeHTML, true, now)
+			upsertMessage(&statusMsg, card.Render(), telego.ModeHTML, true, now)
 		}
 		if contentMsg.dirty && (contentMsg.lastEdit.IsZero() || now.Sub(contentMsg.lastEdit) >= contentMinGap) {
 			upsertMessage(&contentMsg, renderContent(), telego.ModeHTML, true, now)
 		}
 		if showCard && statusMsg.id != 0 && !statusMsg.dirty && (statusMsg.lastEdit.IsZero() || now.Sub(statusMsg.lastEdit) >= statusHeartbeatDelay) {
-			upsertMessage(&statusMsg, card.render(), telego.ModeHTML, true, now)
+			upsertMessage(&statusMsg, card.Render(), telego.ModeHTML, true, now)
 		}
 	}
 
@@ -913,7 +770,7 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 			switch event.Type {
 			case api.EventIterationStart:
 				if event.Iteration != nil {
-					card.iteration = *event.Iteration + 1
+					card.SetIteration(*event.Iteration + 1)
 				}
 				if textBuf.Len() > 0 {
 					textBuf.Reset()
@@ -953,11 +810,11 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 				var summary string
 				if pendingToolInput != nil {
 					if raw, ok := pendingToolInput[event.ToolUseID]; ok {
-						summary = summarizeToolInput(event.Name, json.RawMessage(raw))
+						summary = telegram.SummarizeToolInput(event.Name, json.RawMessage(raw))
 						delete(pendingToolInput, event.ToolUseID)
 					}
 				}
-				card.addTool(event.ToolUseID, event.Name, summary)
+				card.AddTool(event.ToolUseID, event.Name, summary)
 				tryUpdateStatus(time.Now())
 
 			case api.EventToolExecutionResult:
@@ -965,7 +822,7 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 				if event.IsError != nil && *event.IsError {
 					failed = true
 				}
-				card.finishTool(event.ToolUseID, failed)
+				card.FinishTool(event.ToolUseID, failed)
 				tryUpdateStatus(time.Now())
 
 			case api.EventError:
@@ -1001,154 +858,114 @@ func (t *TelegramChannel) SendStream(ctx context.Context, chatID string, metadat
 	return t.Send(bus.OutboundMessage{ChatID: chatID, Content: finalText, Metadata: metadata})
 }
 
-// toTelegramHTML converts basic markdown to Telegram HTML.
-func toTelegramHTML(s string) string {
-	s = convertThinkTags(s)
-	type segment struct {
-		text   string
-		isCode bool
+// loadSlashCommands loads slash commands from workspace/.telegram/slashes/*.md
+func (t *TelegramChannel) loadSlashCommands() {
+	t.slashCommands = make(map[string]telegram.Command)
+	dir := filepath.Join(t.workspace, ".telegram", "slashes")
+	cmds, err := telegram.LoadCommands(dir)
+	if err != nil {
+		log.Printf("[telegram] load slash commands: %v", err)
+		return
 	}
-	var segments []segment
-	for len(s) > 0 {
-		if idx := strings.Index(s, "```"); idx >= 0 {
-			if idx > 0 {
-				segments = append(segments, segment{text: s[:idx]})
-			}
-			end := strings.Index(s[idx+3:], "```")
-			if end == -1 {
-				segments = append(segments, segment{text: s[idx:]})
-				s = ""
-				break
-			}
-			end += idx + 3
-			code := s[idx+3 : end]
-			if nl := strings.Index(code, "\n"); nl >= 0 {
-				firstLine := strings.TrimSpace(code[:nl])
-				if len(firstLine) > 0 && !strings.Contains(firstLine, " ") {
-					code = code[nl+1:]
-				}
-			}
-			segments = append(segments, segment{text: "<pre>" + escapeHTML(code) + "</pre>", isCode: true})
-			s = s[end+3:]
-			continue
-		}
-		if idx := strings.Index(s, "`"); idx >= 0 {
-			if idx > 0 {
-				segments = append(segments, segment{text: s[:idx]})
-			}
-			end := strings.Index(s[idx+1:], "`")
-			if end == -1 {
-				segments = append(segments, segment{text: s[idx:]})
-				s = ""
-				break
-			}
-			end += idx + 1
-			segments = append(segments, segment{text: "<code>" + escapeHTML(s[idx+1:end]) + "</code>", isCode: true})
-			s = s[end+1:]
-			continue
-		}
-		segments = append(segments, segment{text: s})
-		break
+	for _, cmd := range cmds {
+		t.slashCommands[cmd.Name] = cmd
 	}
-	var out strings.Builder
-	for _, seg := range segments {
-		if seg.isCode {
-			out.WriteString(seg.text)
-			continue
-		}
-		text := escapeHTMLPreservingTags(seg.text)
-		text = convertBoldItalic(text)
-		out.WriteString(text)
+	if len(t.slashCommands) > 0 {
+		log.Printf("[telegram] loaded %d slash commands", len(t.slashCommands))
 	}
-	return out.String()
 }
 
-// escapeHTML escapes &, <, > for Telegram HTML.
-func escapeHTML(s string) string {
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	return s
-}
-
-// convertBoldItalic converts **bold** and *italic* markdown to HTML tags.
-func convertBoldItalic(s string) string {
-	// Bold pass: **text** -> <b>text</b>
-	for {
-		start := strings.Index(s, "**")
-		if start == -1 {
-			break
-		}
-		end := strings.Index(s[start+2:], "**")
-		if end == -1 {
-			break
-		}
-		end += start + 2
-		// Recursively convert italic inside bold content
-		inner := convertItalic(s[start+2 : end])
-		s = s[:start] + "<b>" + inner + "</b>" + s[end+2:]
+func (t *TelegramChannel) isSlashCommand(msg *telego.Message) bool {
+	if msg.Text == "" {
+		return false
 	}
-	// Italic pass on remaining text (outside bold)
-	s = convertItalic(s)
-	return s
-}
-
-// convertItalic converts *italic* markdown to <i> tags.
-func convertItalic(s string) string {
-	for {
-		start := strings.Index(s, "*")
-		if start == -1 {
-			break
+	for _, e := range msg.Entities {
+		if e.Type == "bot_command" && e.Offset == 0 {
+			return true
 		}
-		if start+1 < len(s) && s[start+1] == '*' {
-			break
-		}
-		end := strings.Index(s[start+1:], "*")
-		if end == -1 {
-			break
-		}
-		end += start + 1
-		if end+1 < len(s) && s[end+1] == '*' {
-			break
-		}
-		s = s[:start] + "<i>" + s[start+1:end] + "</i>" + s[end+1:]
 	}
-	return s
+	return false
 }
 
-// convertThinkTags converts <think>...</think> to Telegram expandable blockquote.
-func convertThinkTags(s string) string {
-	const openTag = "<think>"
-	const closeTag = "</think>"
-	var result strings.Builder
-	for {
-		start := strings.Index(s, openTag)
-		if start == -1 {
-			result.WriteString(s)
-			break
-		}
-		end := strings.Index(s[start+len(openTag):], closeTag)
-		if end == -1 {
-			result.WriteString(s)
-			break
-		}
-		end += start + len(openTag)
-		thinkContent := s[start+len(openTag) : end]
-		result.WriteString(s[:start])
-		result.WriteString("<blockquote expandable>🧠 Thinking\n")
-		result.WriteString(thinkContent)
-		result.WriteString("\n</blockquote>")
-		s = s[end+len(closeTag):]
+func (t *TelegramChannel) handleSlashCommand(msg *telego.Message) {
+	parts := strings.Fields(msg.Text)
+	if len(parts) == 0 {
+		return
 	}
-	return result.String()
+	cmdName := strings.TrimPrefix(parts[0], "/")
+	args := ""
+	if len(parts) > 1 {
+		args = strings.Join(parts[1:], " ")
+	}
+
+	cmd, ok := t.slashCommands[cmdName]
+	if !ok {
+		t.bot.SendMessage(context.Background(), tu.Message(tu.ID(msg.Chat.ID), "Unknown command: /"+cmdName))
+		return
+	}
+
+	switch cmd.Type {
+	case "instant":
+		sessionID := fmt.Sprintf("%s:%d", telegramChannelName, msg.Chat.ID)
+		resp := t.executeInstantCommand(cmd, args, sessionID)
+		t.bot.SendMessage(context.Background(), tu.Message(tu.ID(msg.Chat.ID), resp))
+	case "oneshot", "conversation":
+		chatID := strconv.FormatInt(msg.Chat.ID, 10)
+		t.bus.Inbound <- bus.InboundMessage{
+			Channel:   telegramChannelName,
+			SenderID:  strconv.FormatInt(msg.From.ID, 10),
+			ChatID:    chatID,
+			Content:   cmd.Prompt,
+			Timestamp: time.Now(),
+			Metadata: map[string]interface{}{
+				"slash_command": cmdName,
+				"slash_type":    cmd.Type,
+				"args":          args,
+			},
+		}
+	}
 }
 
-// escapeHTMLPreservingTags escapes &, <, > but preserves blockquote tags from convertThinkTags.
-func escapeHTMLPreservingTags(s string) string {
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	s = strings.ReplaceAll(s, "&lt;blockquote expandable&gt;", "<blockquote expandable>")
-	s = strings.ReplaceAll(s, "&lt;/blockquote&gt;", "</blockquote>")
-	return s
+func (t *TelegramChannel) executeInstantCommand(cmd telegram.Command, args, sessionID string) string {
+	switch cmd.Name {
+	case "status":
+		return "✅ Bot is running"
+	case "help":
+		var sb strings.Builder
+		sb.WriteString("Available commands:\n")
+		for name, c := range t.slashCommands {
+			sb.WriteString(fmt.Sprintf("/%s - %s\n", name, c.Description))
+		}
+		return sb.String()
+	case "compact":
+		return t.executeCompact(sessionID)
+	default:
+		if cmd.Handler != "" {
+			return t.executeHandler(cmd.Handler, args, sessionID)
+		}
+		return cmd.Prompt
+	}
+}
+
+func (t *TelegramChannel) executeHandler(handler, args, sessionID string) string {
+	handlerPath := filepath.Join(t.workspace, ".telegram", "handlers", handler)
+	if !filepath.IsAbs(handler) {
+		handler = handlerPath
+	}
+
+	cmd := exec.Command(handler, sessionID, args)
+	cmd.Env = append(os.Environ(),
+		"WORKSPACE="+t.workspace,
+		"SESSION_ID="+sessionID,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("❌ Handler failed: %v\n%s", err, output)
+	}
+	return string(output)
+}
+
+func (t *TelegramChannel) executeCompact(sessionID string) string {
+	return "⚠️ Compact not yet implemented"
 }

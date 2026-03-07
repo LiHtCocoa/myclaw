@@ -19,6 +19,7 @@ import (
 	"github.com/mymmrac/telego"
 	ta "github.com/mymmrac/telego/telegoapi"
 	"github.com/stellarlinkco/myclaw/internal/bus"
+	"github.com/stellarlinkco/myclaw/internal/channel/telegram"
 	"github.com/stellarlinkco/myclaw/internal/config"
 )
 
@@ -160,9 +161,9 @@ func TestToTelegramHTML(t *testing.T) {
 		{"<tag>", "&lt;tag&gt;"},
 	}
 	for _, tt := range tests {
-		got := toTelegramHTML(tt.input)
+		got := telegram.ToTelegramHTML(tt.input)
 		if got != tt.want {
-			t.Errorf("toTelegramHTML(%q) = %q, want %q", tt.input, got, tt.want)
+			t.Errorf("telegram.ToTelegramHTML(%q) = %q, want %q", tt.input, got, tt.want)
 		}
 	}
 }
@@ -183,9 +184,9 @@ func TestToTelegramHTML_CodeBlocks(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := toTelegramHTML(tt.input)
+			got := telegram.ToTelegramHTML(tt.input)
 			if got != tt.want {
-				t.Errorf("toTelegramHTML(%q) = %q, want %q", tt.input, got, tt.want)
+				t.Errorf("telegram.ToTelegramHTML(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
 	}
@@ -929,8 +930,8 @@ func TestTelegramChannel_InitBot_InvalidProxy(t *testing.T) {
 // === Status Card Tests ===
 
 func TestStatusCard_Render_Empty(t *testing.T) {
-	card := newStatusCard()
-	html := card.render()
+	card := telegram.NewStatusCard()
+	html := card.Render()
 	if !strings.Contains(html, "Working...") {
 		t.Errorf("expected Working... in card, got %q", html)
 	}
@@ -940,11 +941,11 @@ func TestStatusCard_Render_Empty(t *testing.T) {
 }
 
 func TestStatusCard_Render_WithTools(t *testing.T) {
-	card := newStatusCard()
-	card.addTool("t1", "Read", "config.go")
-	card.addTool("t2", "Grep", "handleAuth")
-	card.finishTool("t1", false)
-	html := card.render()
+	card := telegram.NewStatusCard()
+	card.AddTool("t1", "Read", "config.go")
+	card.AddTool("t2", "Grep", "handleAuth")
+	card.FinishTool("t1", false)
+	html := card.Render()
 	if !strings.Contains(html, "✅") {
 		t.Error("expected ✅ for finished tool")
 	}
@@ -959,19 +960,19 @@ func TestStatusCard_Render_WithTools(t *testing.T) {
 	}
 }
 func TestStatusCard_Render_WithIteration(t *testing.T) {
-	card := newStatusCard()
-	card.iteration = 3
-	card.addTool("t1", "Bash", "ls -la")
-	html := card.render()
+	card := telegram.NewStatusCard()
+	card.SetIteration(3)
+	card.AddTool("t1", "Bash", "ls -la")
+	html := card.Render()
 	if !strings.Contains(html, "Iteration 3") {
 		t.Errorf("expected Iteration 3 in card, got %q", html)
 	}
 }
 func TestStatusCard_FinishTool_Error(t *testing.T) {
-	card := newStatusCard()
-	card.addTool("t1", "Edit", "main.go")
-	card.finishTool("t1", true)
-	html := card.render()
+	card := telegram.NewStatusCard()
+	card.AddTool("t1", "Edit", "main.go")
+	card.FinishTool("t1", true)
+	html := card.Render()
 	if !strings.Contains(html, "❌") {
 		t.Error("expected ❌ for failed tool")
 	}
@@ -992,9 +993,9 @@ func TestSummarizeToolInput(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := summarizeToolInput(tt.tool, json.RawMessage(tt.input))
+			got := telegram.SummarizeToolInput(tt.tool, json.RawMessage(tt.input))
 			if got != tt.want {
-				t.Errorf("summarizeToolInput(%s) = %q, want %q", tt.tool, got, tt.want)
+				t.Errorf("telegram.SummarizeToolInput(%s) = %q, want %q", tt.tool, got, tt.want)
 			}
 		})
 	}
