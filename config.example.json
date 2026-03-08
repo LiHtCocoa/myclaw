@@ -16,7 +16,8 @@
       "enabled": false,
       "token": "",
       "allowFrom": [],
-      "proxy": ""
+      "proxy": "",
+      "rootDir": ""
     },
     "feishu": {
       "enabled": false,

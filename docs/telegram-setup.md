@@ -29,7 +29,8 @@
       "enabled": true,
       "token": "1234567890:ABCdefGHIjklMNOpqrsTUVwxyz",
       "allowFrom": [],
-      "proxy": ""
+      "proxy": "",
+      "rootDir": ""
     }
   }
 }
@@ -49,6 +50,7 @@ export MYCLAW_TELEGRAM_TOKEN="1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"
 | `token` | string | BotFather 提供的 Bot Token |
 | `allowFrom` | []string | 允许的用户 ID 列表（空 = 允许所有人） |
 | `proxy` | string | 代理地址（如 `socks5://127.0.0.1:1080`），国内网络需要 |
+| `rootDir` | string | Telegram 资源目录，默认是 `<agent.workspace>/.telegram`，其中包含 `slashes/` 和 `handlers/` |
 
 ### 获取你的用户 ID
 

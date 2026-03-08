@@ -58,6 +58,9 @@ type TelegramConfig struct {
 	Token     string   `json:"token"`
 	AllowFrom []string `json:"allowFrom"`
 	Proxy     string   `json:"proxy,omitempty"`
+	RootDir   string   `json:"rootDir,omitempty"`   // default: <agent.workspace>/.telegram
+	Feedback  string   `json:"feedback,omitempty"`  // "debug", "normal" (default), "minimal", "silent"
+	Streaming bool     `json:"streaming,omitempty"` // enable streaming output via message editing
 }
 
 type FeishuConfig struct {

@@ -139,3 +139,8 @@ func (m *ChannelManager) EnabledChannels() []string {
 	}
 	return names
 }
+
+// GetChannel returns a channel by name, or nil if not found.
+func (m *ChannelManager) GetChannel(name string) Channel {
+	return m.channels[name]
+}

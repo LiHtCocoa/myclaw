@@ -10,12 +10,15 @@ import (
 
 	"github.com/cexll/agentsdk-go/pkg/api"
 	"github.com/cexll/agentsdk-go/pkg/model"
+	"github.com/cexll/agentsdk-go/pkg/runtime/commands"
 	"github.com/stellarlinkco/myclaw/internal/bus"
 	"github.com/stellarlinkco/myclaw/internal/channel"
 	"github.com/stellarlinkco/myclaw/internal/config"
 	"github.com/stellarlinkco/myclaw/internal/cron"
 	"github.com/stellarlinkco/myclaw/internal/heartbeat"
 	"github.com/stellarlinkco/myclaw/internal/memory"
+	"github.com/stellarlinkco/myclaw/internal/runtimecmd"
+	"github.com/stellarlinkco/myclaw/internal/session"
 )
 
 // mockRuntime implements Runtime interface for testing
@@ -38,6 +41,22 @@ func (m *mockRuntime) Run(ctx context.Context, req api.Request) (*api.Response, 
 
 func (m *mockRuntime) Close() {
 	m.closed = true
+}
+func (m *mockRuntime) RunStream(ctx context.Context, req api.Request) (<-chan api.StreamEvent, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	ch := make(chan api.StreamEvent, 1)
+	go func() {
+		defer close(ch)
+		if m.response != nil && m.response.Result != nil {
+			ch <- api.StreamEvent{
+				Type:  api.EventContentBlockDelta,
+				Delta: &api.Delta{Text: m.response.Result.Output},
+			}
+		}
+	}()
+	return ch, nil
 }
 
 func TestTruncate(t *testing.T) {
@@ -887,6 +906,128 @@ func TestGateway_CronOnJob_Error(t *testing.T) {
 	_, err = g.cron.OnJob(job)
 	if err != context.DeadlineExceeded {
 		t.Errorf("expected DeadlineExceeded, got %v", err)
+	}
+}
+
+func TestGateway_ProcessLoop_CompactPostAction(t *testing.T) {
+	tmpDir := t.TempDir()
+	router, err := session.New(filepath.Join(tmpDir, "router.json"))
+	if err != nil {
+		t.Fatalf("session.New error: %v", err)
+	}
+
+	msgBus := bus.NewMessageBus(10)
+	mockRt := &mockRuntime{
+		response: &api.Response{
+			Result: &api.Result{Output: "important user goals and pending tasks"},
+			CommandResults: []api.CommandExecution{{
+				Result: commands.Result{Metadata: map[string]any{
+					runtimecmd.MetaPostAction: runtimecmd.PostActionCompactRotate,
+					runtimecmd.MetaResponse:   runtimecmd.ResponseCompactAck,
+				}},
+			}},
+		},
+	}
+
+	g := &Gateway{
+		cfg:      &config.Config{Agent: config.AgentConfig{Workspace: tmpDir}},
+		bus:      msgBus,
+		runtime:  mockRt,
+		sessions: router,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go g.processLoop(ctx)
+
+	msgBus.Inbound <- bus.InboundMessage{
+		Channel:  "telegram",
+		SenderID: "user1",
+		ChatID:   "chat1",
+		Content:  "/compact",
+		Metadata: map[string]any{
+			"slash_command":       "compact",
+			"slash_type":          "pipeline",
+			"force_non_streaming": true,
+		},
+	}
+
+	select {
+	case outMsg := <-msgBus.Outbound:
+		if outMsg.Content != "✅ Conversation compacted and continued in a fresh session." {
+			t.Fatalf("unexpected outbound content: %q", outMsg.Content)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for compact response")
+	}
+
+	baseSession := "telegram:chat1"
+	currentSession := router.Resolve(baseSession, baseSession)
+	if currentSession == baseSession {
+		t.Fatal("expected compact to rotate session")
+	}
+
+	seedPath := filepath.Join(tmpDir, ".claude", "history", currentSession+".json")
+	data, err := os.ReadFile(seedPath)
+	if err != nil {
+		t.Fatalf("read compact seed: %v", err)
+	}
+	if !contains(string(data), "important user goals and pending tasks") {
+		t.Fatalf("compact seed missing summary: %s", string(data))
+	}
+}
+
+func TestGateway_ProcessLoop_BuiltinNewSkipsRuntime(t *testing.T) {
+	tmpDir := t.TempDir()
+	router, err := session.New(filepath.Join(tmpDir, "router.json"))
+	if err != nil {
+		t.Fatalf("session.New error: %v", err)
+	}
+
+	msgBus := bus.NewMessageBus(10)
+	reqCh := make(chan api.Request, 1)
+	mockRt := &mockRuntime{reqCh: reqCh}
+
+	g := &Gateway{
+		cfg:      &config.Config{Agent: config.AgentConfig{Workspace: tmpDir}},
+		bus:      msgBus,
+		runtime:  mockRt,
+		sessions: router,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go g.processLoop(ctx)
+
+	msgBus.Inbound <- bus.InboundMessage{
+		Channel:  "telegram",
+		SenderID: "user1",
+		ChatID:   "chat1",
+		Metadata: map[string]any{
+			"builtin_command":     "new",
+			"force_non_streaming": true,
+		},
+	}
+
+	select {
+	case outMsg := <-msgBus.Outbound:
+		if outMsg.Content != "✅ Started a fresh session." {
+			t.Fatalf("unexpected outbound content: %q", outMsg.Content)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for new-session response")
+	}
+
+	select {
+	case req := <-reqCh:
+		t.Fatalf("runtime should not be called for builtin command, got %+v", req)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	baseSession := "telegram:chat1"
+	currentSession := router.Resolve(baseSession, baseSession)
+	if currentSession == baseSession {
+		t.Fatal("expected /new to rotate session")
 	}
 }
 
