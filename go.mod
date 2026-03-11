@@ -3,7 +3,7 @@ module github.com/stellarlinkco/myclaw
 go 1.25.5
 
 require (
-	github.com/cexll/agentsdk-go v0.9.3
+	github.com/cexll/agentsdk-go v0.9.5
 	github.com/coder/websocket v1.8.14
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/mymmrac/telego v1.6.0
@@ -83,3 +83,5 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	rsc.io/qr v0.2.0 // indirect
 )
+
+replace github.com/cexll/agentsdk-go => ../agentsdk-go
