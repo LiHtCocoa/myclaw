@@ -1301,6 +1301,47 @@ func TestTelegramChannel_SendStream_FinalSendFailureKeepsIntermediateMessages(t 
 	}
 }
 
+func TestTelegramRetryAfter(t *testing.T) {
+	delay, ok := telegramRetryAfter(errors.New(`telego: editMessageText: api: 429 "Too Many Requests: retry after 717", migrate to chat ID: 0, retry after: 717`))
+	if !ok {
+		t.Fatal("expected retry after to be detected")
+	}
+	if delay != 717*time.Second {
+		t.Fatalf("delay = %v, want %v", delay, 717*time.Second)
+	}
+	if _, ok := telegramRetryAfter(errors.New("plain error")); ok {
+		t.Fatal("unexpected retry after for plain error")
+	}
+}
+
+func TestTelegramChannel_SendStream_FinalSend429RetriesOnce(t *testing.T) {
+	ch, caller := newTestChannel(t, config.TelegramConfig{Streaming: true, Feedback: "debug"})
+	caller.methodErrSeq = map[string][]error{
+		"sendMessage": {nil, errors.New(`telego: sendMessage: api: 429 "Too Many Requests: retry after 0", migrate to chat ID: 0, retry after: 0`), nil},
+	}
+
+	events := make(chan api.StreamEvent, 10)
+	iter := 0
+	events <- api.StreamEvent{Type: api.EventIterationStart, Iteration: &iter}
+	events <- api.StreamEvent{Type: api.EventToolExecutionStart, ToolUseID: "t1", Name: "Read", Iteration: &iter}
+	events <- api.StreamEvent{Type: api.EventContentBlockDelta, Delta: &api.Delta{Type: "text_delta", Text: "partial result"}}
+	close(events)
+
+	if err := ch.SendStream(context.Background(), "123", nil, events); err != nil {
+		t.Fatalf("SendStream error: %v", err)
+	}
+
+	var sendCount int
+	for _, c := range caller.calls {
+		if strings.HasSuffix(c.URL, "/sendMessage") {
+			sendCount++
+		}
+	}
+	if sendCount < 3 {
+		t.Fatalf("expected retry after final send 429, got %d sendMessage calls", sendCount)
+	}
+}
+
 func TestTelegramChannel_SaveFile_SanitizesName(t *testing.T) {
 	ch, _ := newTestChannel(t, config.TelegramConfig{})
 	tmpDir := t.TempDir()
